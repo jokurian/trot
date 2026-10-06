@@ -3,17 +3,19 @@ from __future__ import annotations
 import dataclasses
 import time
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from .core.ops import MeasOps, TrialOps
 from .core.system import System
-from .prop.blocks import BlockFn, MixedBlockFn
+from .prop.blocks import BlockFn, MixedBlockFn, block as default_block, block_ad_1rdm
 from .prop.types import PropOps, PropState, QmcParamsBase, QmcParams, QmcParamsFp
 from .stat_utils import (
     blocking_analysis_ratio,
@@ -37,6 +39,16 @@ class QmcResult(NamedTuple):
     block_observables: dict[str, jax.Array]
     observable_means: dict[str, jax.Array]
     observable_stderrs: dict[str, jax.Array]
+
+
+class QmcRdm1Result(NamedTuple):
+    mean_energy: float
+    stderr_energy: float
+    rdm1: np.ndarray
+    rdm1_err: np.ndarray
+    block_energies: np.ndarray
+    block_weights: np.ndarray
+    block_rdm1: np.ndarray
 
 
 class MixedQmcResult(NamedTuple):
@@ -403,6 +415,204 @@ def run_qmc(
         block_observables=block_obs_all,
         observable_means=obs_means,
         observable_stderrs=obs_stderrs,
+    )
+
+
+def run_qmc_ad_1rdm(
+    *,
+    sys: System,
+    params: QmcParams,
+    ham_data: Any,
+    trial_data: Any,
+    meas_ops: MeasOps,
+    trial_ops: TrialOps,
+    prop_ops: PropOps,
+    state: PropState | None = None,
+    output: str | Path = "rdm1_afqmc.npz",
+    target_error: float | None = None,
+    mesh: Mesh | None = None,
+    n_ad_runs: int = 1,
+    n_blocks_per_ad_run: int = 1,
+    sr_interval: int = 1,
+    orbital_relaxation: bool = True,
+) -> QmcRdm1Result:
+    """
+    Run AFQMC and write the active-space AD 1RDM to disk.
+    """
+    if n_blocks_per_ad_run % sr_interval != 0:
+        raise ValueError(
+            "n_blocks_per_ad_run must be divisible by sr_interval "
+            f"({n_blocks_per_ad_run} % {sr_interval} != 0)."
+        )
+    total_ad_blocks = n_ad_runs * n_blocks_per_ad_run
+
+    print("\nAD 1RDM Params:")
+    print(f"  n_ad_runs            = {n_ad_runs}")
+    print(f"  n_blocks_per_ad_run  = {n_blocks_per_ad_run}")
+    print(f"  sr_interval          = {sr_interval}")
+    print(f"  orbital_relaxation   = {orbital_relaxation}")
+    print(f"  total_ad_blocks      = {total_ad_blocks}")
+
+    trial_rdm1 = trial_ops.get_rdm1(trial_data)
+    prop_ctx = prop_ops.build_prop_ctx(ham_data, trial_rdm1, params)
+    meas_ctx = meas_ops.build_meas_ctx(ham_data, trial_data)
+    if state is None:
+        state = prop_ops.init_prop_state(
+            sys=sys,
+            ham_data=ham_data,
+            trial_ops=trial_ops,
+            trial_data=trial_data,
+            meas_ops=meas_ops,
+            params=params,
+            rdm1=trial_rdm1,
+            mesh=mesh,
+        )
+
+    run_eql_blocks = make_run_blocks(
+        block_fn=default_block,
+        sys=sys,
+        params=params,
+        trial_ops=trial_ops,
+        meas_ops=meas_ops,
+        prop_ops=prop_ops,
+        observable_names=(),
+    )
+    run_ad_blocks = make_run_blocks(
+        block_fn=partial(
+            block_ad_1rdm,
+            n_blocks_per_ad_run=n_blocks_per_ad_run,
+            sr_interval=sr_interval,
+            orbital_relaxation=orbital_relaxation,
+        ),
+        sys=sys,
+        params=params,
+        trial_ops=trial_ops,
+        meas_ops=meas_ops,
+        prop_ops=prop_ops,
+        observable_names=("ad_rdm1",),
+    )
+
+    print("\nEquilibration:\n")
+    if params.n_eql_blocks > 0:
+        state, scalars_eq, _ = run_eql_blocks(
+            state,
+            ham_data=ham_data,
+            trial_data=trial_data,
+            meas_ctx=meas_ctx,
+            prop_ctx=prop_ctx,
+            n_blocks=params.n_eql_blocks,
+        )
+        e_eq = scalars_eq["energy"]
+        w_eq = scalars_eq["weight"]
+        print(
+            f"[eql {params.n_eql_blocks:4d}/{params.n_eql_blocks}]  "
+            f"{float(jnp.mean(e_eq * w_eq) / jnp.mean(w_eq)):14.10f}  "
+            f"{float(jnp.mean(w_eq)):12.6e}"
+        )
+    else:
+        print("[eql    0/0]  skipped")
+
+    print("\nAD sampling:\n")
+    print(
+        f"{'':4s}"
+        f"{'ad':>9s}  "
+        f"{'block':>14s}  "
+        f"{'E_avg':>14s}  "
+        f"{'E_err':>10s}  "
+        f"{'E_block':>14s}  "
+        f"{'W':>12s}  "
+        f"{'nodes':>10s}  "
+        f"{'dt[s/ad]':>10s}  "
+        f"{'t[s]':>7s}"
+    )
+    t0 = time.perf_counter()
+    t_mark = t0
+    block_e_parts = []
+    block_w_parts = []
+    block_rdm1_parts = []
+    for n in range(1, n_ad_runs + 1):
+        state, scalars_run, obs_run = run_ad_blocks(
+            state,
+            ham_data=ham_data,
+            trial_data=trial_data,
+            meas_ctx=meas_ctx,
+            prop_ctx=prop_ctx,
+            n_blocks=1,
+        )
+        block_e_run = np.asarray(jax.device_get(scalars_run["energy"]), dtype=float)
+        block_w_run = np.asarray(jax.device_get(scalars_run["weight"]), dtype=float)
+        block_rdm1_run = np.asarray(jax.device_get(obs_run[0]))
+        block_e_parts.append(block_e_run)
+        block_w_parts.append(block_w_run)
+        block_rdm1_parts.append(block_rdm1_run)
+        block_e_so_far = np.concatenate(block_e_parts, axis=0)
+        block_w_so_far = np.concatenate(block_w_parts, axis=0)
+        stats_run = blocking_analysis_ratio(block_e_so_far, block_w_so_far, print_q=False)
+        mu = stats_run["mu"]
+        se = stats_run["se_star"]
+        t_now = time.perf_counter()
+        elapsed = t_now - t0
+        dt_per_ad = t_now - t_mark
+        t_mark = t_now
+        nodes = int(state.node_encounters)
+        print(
+            f"[ad {n:4d}/{n_ad_runs}]  "
+            f"[blk {n * n_blocks_per_ad_run:4d}/{total_ad_blocks}]  "
+            f"{mu:14.10f}  "
+            f"{(f'{se:10.3e}' if se is not None else ' ' * 10)}  "
+            f"{float(block_e_run[0]):14.10f}  "
+            f"{float(block_w_run[0]):12.6e}  "
+            f"{nodes:10d}  "
+            f"{dt_per_ad:9.3f}  "
+            f"{elapsed:8.1f}"
+        )
+    block_e_s = np.concatenate(block_e_parts, axis=0)
+    block_w_s = np.concatenate(block_w_parts, axis=0)
+    block_rdm1_s = np.concatenate(block_rdm1_parts, axis=0)
+
+    data_clean, keep_mask = reject_outliers(
+        np.column_stack((block_e_s, block_w_s)),
+        obs=0,
+    )
+    print(f"\nRejected {block_e_s.shape[0] - data_clean.shape[0]} outlier blocks.")
+    clean_energies = np.asarray(data_clean[:, 0], dtype=float)
+    clean_weights = np.asarray(data_clean[:, 1], dtype=float)
+    clean_rdm1 = block_rdm1_s[np.asarray(keep_mask, dtype=bool)]
+
+    print("\nFinal blocking analysis:")
+    stats = blocking_analysis_ratio(clean_energies, clean_weights, print_q=True)
+    mean_energy = float(stats["mu"])
+    stderr_energy = float("nan") if stats["se_star"] is None else float(stats["se_star"])
+
+    w_sum = np.sum(clean_weights)
+    w_shape = (clean_weights.shape[0],) + (1,) * (clean_rdm1.ndim - 1)
+    rdm1 = np.sum(clean_weights.reshape(w_shape) * clean_rdm1, axis=0) / w_sum
+    rdm1_err = np.full(rdm1.shape, np.nan, dtype=float)
+    block_size = stats.get("B_star")
+    if block_size is not None and block_size >= 1:
+        num, denom = rebin_observable(clean_rdm1, clean_weights, int(block_size))
+        if num.shape[0] >= 2:
+            _, rdm1_err = jackknife_ratios(num, denom)
+
+    out = Path(output).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(out, rdm1=rdm1, rdm1_err=rdm1_err)
+    print(f"AFQMC energy = {mean_energy:.12f} +/- {stderr_energy:.3e}")
+    if rdm1.ndim == 3 and rdm1.shape[0] == 2:
+        rdm1_trace = np.trace(rdm1[0]) + np.trace(rdm1[1])
+    else:
+        rdm1_trace = np.trace(rdm1)
+    print(f"AD 1RDM trace = {float(rdm1_trace.real):.12f}")
+    print(f"Wrote {out}")
+
+    return QmcRdm1Result(
+        mean_energy=mean_energy,
+        stderr_energy=stderr_energy,
+        rdm1=rdm1,
+        rdm1_err=rdm1_err,
+        block_energies=clean_energies,
+        block_weights=clean_weights,
+        block_rdm1=clean_rdm1,
     )
 
 

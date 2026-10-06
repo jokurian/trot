@@ -20,6 +20,10 @@ class Rdm1Fn(Protocol):
     def __call__(self, trial_data: Any) -> jax.Array: ...
 
 
+class OptimizeTrialFn(Protocol):
+    def __call__(self, ham_data: Any, trial_data: Any) -> Any: ...
+
+
 class GreensFn(Protocol):
     # returns the CPMC cache for one walker
     #   - single det: Array (n,n)
@@ -51,6 +55,7 @@ class TrialOps(NamedTuple):
     Trial operations.
       - overlap: overlap for a single walker
       - get_rdm1: trial rdm1
+      - optimize: optional trial relaxation for AD paths
       Optional fast update functions (mainly for CPMC):
       - calc_green: compute the greens function
       - calc_overlap_ratio: compute overlap ratio for updates
@@ -66,6 +71,7 @@ class TrialOps(NamedTuple):
     update_green: UpdateGreenFn | None = (
         None  # (greens, update_indices, update_constants) -> new_greens
     )
+    optimize: OptimizeTrialFn | None = None  # (ham_data, trial_data) -> trial_data
 
 
 @dataclass(frozen=True)

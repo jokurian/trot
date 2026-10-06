@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jax import tree_util
+from jax import lax, tree_util
 
 from ..core.ops import TrialOps
 from ..core.system import System
@@ -40,6 +41,35 @@ def get_rdm1(trial_data: RhfTrial) -> jax.Array:
     c = trial_data.mo_coeff
     dm = c @ c.conj().T  # (norb, norb)
     return jnp.stack([dm, dm], axis=0)  # (2, norb, norb)
+
+
+def _canonicalize_evec_signs(mo_energy: jax.Array, mo_coeff: jax.Array) -> jax.Array:
+    idx = jnp.argmax(jnp.abs(jnp.real(mo_coeff)), axis=0)
+    signs = jnp.where(jnp.real(mo_coeff[idx, jnp.arange(mo_energy.size)]) < 0, -1, 1)
+    return mo_coeff * signs
+
+
+def optimize(ham_data: Any, trial_data: RhfTrial, n_opt_iter: int = 30) -> RhfTrial:
+    h1 = (ham_data.h1 + ham_data.h1.T.conj()) * 0.5
+    chol = ham_data.chol
+    nocc = trial_data.nocc
+
+    def scanned_fun(dm: jax.Array, _x: Any):
+        f = jnp.einsum("gij,ik->gjk", chol, dm, optimize="optimal")
+        c = jax.vmap(jnp.trace)(f)
+        vj = jnp.einsum("g,gij->ij", c, chol, optimize="optimal")
+        vk = jnp.einsum("glj,gjk->lk", f, chol, optimize="optimal")
+        fock = h1 + vj - 0.5 * vk
+        mo_energy, mo_coeff = jnp.linalg.eigh((fock + fock.T.conj()) * 0.5)
+        mo_coeff = _canonicalize_evec_signs(mo_energy, mo_coeff)
+        e_idx = jnp.argsort(mo_energy)
+        mo_occ = mo_coeff[:, e_idx[:nocc]]
+        dm_next = 2.0 * (mo_occ @ mo_occ.T.conj())
+        return dm_next, mo_occ
+
+    dm0 = 2.0 * (trial_data.mo_coeff @ trial_data.mo_coeff.T.conj())
+    _, mo_occ = lax.scan(scanned_fun, dm0, xs=None, length=n_opt_iter)
+    return RhfTrial(mo_coeff=mo_occ[-1])
 
 
 def overlap_r(walker: jax.Array, trial_data: RhfTrial) -> jax.Array:
@@ -84,6 +114,7 @@ def make_rhf_trial_ops(sys: System) -> TrialOps:
     return TrialOps(
         overlap=overlap_fn,
         get_rdm1=get_rdm1_fn,
+        optimize=optimize,
     )
 
 

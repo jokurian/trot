@@ -158,6 +158,8 @@ class Afqmc:
         self.e_err: Any = None
         self.block_energies: Any = None
         self.block_weights: Any = None
+        self.rdm1: Any = None
+        self.rdm1_err: Any = None
 
     @property
     def staged(self) -> StagedInputs | None:
@@ -381,6 +383,70 @@ class Afqmc:
         return e_tot, e_err
 
     run = kernel
+
+    def kernel_rdm1(
+        self,
+        output: Union[str, Path] = "rdm1_afqmc.npz",
+        n_ad_runs: int = 1,
+        n_blocks_per_ad_run: int = 1,
+        sr_interval: int = 1,
+        orbital_relaxation: bool = True,
+        **driver_kwargs: Any,
+    ) -> tuple[float, float, NDArray, NDArray]:
+        """
+        Runs AFQMC and writes the active-space AD 1RDM to disk.
+        """
+        from jax import numpy as jnp
+
+        from .driver import run_qmc_ad_1rdm
+        from .ham.chol import HamChol
+
+        print(banner_afqmc())
+        print_runtime_provenance()
+        mesh = driver_kwargs.pop("mesh", None)
+        state = driver_kwargs.pop("state", None)
+        target_error = driver_kwargs.pop("target_error", None)
+        if driver_kwargs:
+            unknown = ", ".join(sorted(driver_kwargs))
+            raise TypeError(f"Unexpected kernel_rdm1 keyword argument(s): {unknown}")
+
+        job = self.build_job(mesh=mesh)
+        self.dump_flags(job)
+
+        staged_ham = job.staged.ham
+        ham_data = HamChol(
+            h0=jnp.asarray(staged_ham.h0),
+            h1=jnp.asarray(staged_ham.h1),
+            chol=jnp.asarray(staged_ham.chol),
+            basis=staged_ham.basis,
+        )
+        qmc_result = run_qmc_ad_1rdm(
+            sys=job.sys,
+            params=cast(QmcParams, job.params),
+            ham_data=ham_data,
+            trial_data=job.trial_data,
+            meas_ops=job.meas_ops,
+            trial_ops=job.trial_ops,
+            prop_ops=job.prop_ops,
+            state=state,
+            output=output,
+            target_error=target_error,
+            mesh=mesh,
+            n_ad_runs=n_ad_runs,
+            n_blocks_per_ad_run=n_blocks_per_ad_run,
+            sr_interval=sr_interval,
+            orbital_relaxation=orbital_relaxation,
+        )
+        e_tot = float(qmc_result.mean_energy)
+        e_err = float(qmc_result.stderr_energy)
+        self.e_tot = e_tot
+        self.e_err = e_err
+        self.block_energies = qmc_result.block_energies
+        self.block_weights = qmc_result.block_weights
+        self.rdm1 = np.asarray(qmc_result.rdm1)
+        self.rdm1_err = np.asarray(qmc_result.rdm1_err)
+        self.qmc_result = qmc_result
+        return e_tot, e_err, self.rdm1, self.rdm1_err
 
     @classmethod
     def _from_staged_common(cls, path: Union[str, Path], **kwargs: Any):

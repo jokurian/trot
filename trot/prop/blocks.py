@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Protocol, cast
 
@@ -283,6 +284,120 @@ def block(
     obs = BlockObs(
         scalars={"energy": e_block, "weight": w_sum},
         observables=obs_samples,
+    )
+    return state, obs
+
+
+def block_ad_1rdm(
+    state: PropState,
+    *,
+    sys: System,
+    params: QmcParams,
+    ham_data: Any,
+    trial_data: Any,
+    trial_ops: TrialOps,
+    meas_ops: MeasOps,
+    meas_ctx: Any,
+    prop_ops: PropOps,
+    prop_ctx: Any,
+    sr_fn: Callable = wk.stochastic_reconfiguration,
+    observable_names: tuple[str, ...] = (),
+    n_blocks_per_ad_run: int = 1,
+    sr_interval: int = 1,
+    orbital_relaxation: bool = True,
+) -> tuple[PropState, BlockObs]:
+    """
+    propagation + AD 1RDM measurement
+    """
+    if n_blocks_per_ad_run % sr_interval != 0:
+        raise ValueError(
+            "n_blocks_per_ad_run must be divisible by sr_interval "
+            f"({n_blocks_per_ad_run} % {sr_interval} != 0)."
+        )
+    n_sr_groups = n_blocks_per_ad_run // sr_interval
+
+    op0 = jnp.zeros_like(ham_data.h1)
+    trial_rdm1 = trial_ops.get_rdm1(trial_data)
+
+    def energy_for_op(op: jax.Array) -> tuple[jax.Array, tuple[PropState, jax.Array]]:
+        ham_op = dataclasses.replace(
+            ham_data,
+            h1=((ham_data.h1 + op) + (ham_data.h1 + op).T) * 0.5,
+        )
+        if orbital_relaxation and trial_ops.optimize is not None:
+            trial_data_op = trial_ops.optimize(ham_op, trial_data)
+            trial_rdm1_op = trial_ops.get_rdm1(trial_data_op)
+        else:
+            trial_data_op = trial_data
+            trial_rdm1_op = trial_rdm1
+
+        meas_ctx_op = meas_ops.build_meas_ctx(ham_op, trial_data_op)
+        prop_ctx_op = prop_ops.build_prop_ctx(ham_op, trial_rdm1_op, params)
+        overlaps_op = wk.vmap_chunked(
+            meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)
+        )(state.walkers, trial_data_op)
+        state_op = state._replace(overlaps=overlaps_op)
+
+        def run_one_block(state_in: PropState, block_sr_fn: Callable) -> tuple[PropState, BlockObs]:
+            return block(
+                state_in,
+                sys=sys,
+                params=params,
+                ham_data=ham_op,
+                trial_data=trial_data_op,
+                trial_ops=trial_ops,
+                meas_ops=meas_ops,
+                meas_ctx=meas_ctx_op,
+                prop_ops=prop_ops,
+                prop_ctx=prop_ctx_op,
+                sr_fn=block_sr_fn,
+                observable_names=(),
+            )
+
+        def no_sr_block(state_in: PropState, _x: Any):
+            state_out, obs = run_one_block(state_in, wk.no_sr)
+            return state_out, (
+                jnp.real(obs.scalars["energy"]),
+                jnp.real(obs.scalars["weight"]),
+            )
+
+        def sr_block(state_in: PropState, _x: Any):
+            state_out, obs = run_one_block(state_in, sr_fn)
+            return state_out, (
+                jnp.real(obs.scalars["energy"]),
+                jnp.real(obs.scalars["weight"]),
+            )
+
+        def sr_group(state_in: PropState, _x: Any):
+            state_mid, (e_no_sr, w_no_sr) = lax.scan(
+                no_sr_block, state_in, xs=None, length=sr_interval - 1
+            )
+
+            state_out, (e_sr, w_sr) = sr_block(state_mid, None)
+            e_blocks = jnp.concatenate((e_no_sr, jnp.atleast_1d(e_sr)), axis=0)
+            w_blocks = jnp.concatenate((w_no_sr, jnp.atleast_1d(w_sr)), axis=0)
+            return state_out, (e_blocks, w_blocks)
+
+        state_out, (e_groups, w_groups) = lax.scan(
+            sr_group, state_op, xs=None, length=n_sr_groups
+        )
+        e_blocks = jnp.ravel(e_groups)
+        w_blocks = jnp.ravel(w_groups)
+        weight = jnp.sum(w_blocks)
+        weight_safe = jnp.where(weight == 0, 1.0, weight)
+        energy = jnp.sum(e_blocks * w_blocks) / weight_safe
+        energy = jnp.where(weight == 0, jnp.real(state.e_estimate), energy)
+        return (
+            energy,
+            (state_out, weight),
+        )
+
+    energy, pullback, aux = jax.vjp(energy_for_op, op0, has_aux=True)
+    rdm1 = pullback(jnp.ones_like(energy))[0]
+    state, weight = aux
+    obs = BlockObs(
+        scalars={"energy": energy, "weight": weight},
+        observables={"ad_rdm1": rdm1},
     )
     return state, obs
 
