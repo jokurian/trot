@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
+from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jax import tree_util
+from jax import lax, tree_util
 
 from ..core.ops import TrialOps
 from ..core.system import System
@@ -63,6 +65,53 @@ def get_rdm1_generalized(trial_data: GhfTrial) -> jax.Array:
     c = trial_data.mo_coeff
     dm = c @ c.conj().T  # (2*norb, 2*norb)
     return dm
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(1,))
+def _occupied_orbitals(fock: jax.Array, nelec: int) -> jax.Array:
+    return jnp.linalg.eigh(fock)[1][:, :nelec]
+
+
+@_occupied_orbitals.defjvp
+def _occupied_orbitals_jvp(nelec, primals, tangents):
+    (fock,), (dfock,) = primals, tangents
+    energy, coeff = jnp.linalg.eigh(fock)
+    occupied, virtual = coeff[:, :nelec], coeff[:, nelec:]
+    # Only occupied-virtual rotations change the determinant; spin degeneracies
+    # within either subspace must not enter the eigenvector derivative.
+    response = virtual.conj().T @ dfock @ occupied
+    response = response / (energy[:nelec][None, :] - energy[nelec:][:, None])
+    return occupied, virtual @ response
+
+
+def optimize(ham_data: Any, trial_data: GhfTrial, n_opt_iter: int = 30) -> GhfTrial:
+    h1 = (ham_data.h1 + ham_data.h1.T.conj()) * 0.5
+    chol = ham_data.chol
+    if ham_data.basis == "restricted":
+        z = jnp.zeros_like(h1)
+        h1 = jnp.block([[h1, z], [z, h1]])
+        z = jnp.zeros_like(chol)
+        chol = jnp.concatenate(
+            [jnp.concatenate([chol, z], axis=2), jnp.concatenate([z, chol], axis=2)],
+            axis=1,
+        )
+    nelec = trial_data.nelec_total
+
+    def scanned_fun(dm: jax.Array, _x: Any):
+        f = jnp.einsum("gij,jk->gik", chol, dm, optimize="optimal")
+        c = jnp.trace(f, axis1=1, axis2=2)
+        vj = jnp.einsum("g,gij->ij", c, chol, optimize="optimal")
+        vk = jnp.einsum("gij,gjk->ik", f, chol, optimize="optimal")
+        fock = h1 + vj - vk
+        mo_occ = _occupied_orbitals((fock + fock.T.conj()) * 0.5, nelec)
+        idx = jnp.argmax(jnp.abs(mo_occ), axis=0)
+        pivots = mo_occ[idx, jnp.arange(nelec)]
+        mo_occ = mo_occ * (pivots.conj() / jnp.abs(pivots))
+        return mo_occ @ mo_occ.T.conj(), mo_occ
+
+    dm0 = get_rdm1_generalized(trial_data).astype(jnp.result_type(h1, chol, trial_data.mo_coeff))
+    _, mo_occ = lax.scan(scanned_fun, dm0, xs=None, length=n_opt_iter)
+    return GhfTrial(mo_coeff=mo_occ[-1])
 
 
 def overlap_r(walker: jax.Array, trial_data: GhfTrial) -> jax.Array:
@@ -242,6 +291,7 @@ def make_ghf_trial_ops(sys: System) -> TrialOps:
     return TrialOps(
         overlap=overlap_fn,
         get_rdm1=get_rdm1_fn,
+        optimize=optimize,
         calc_green=calc_green_fn,
         update_green=update_green_fn,
         calc_overlap_ratio=calc_overlap_ratio_fn,
