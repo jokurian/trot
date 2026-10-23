@@ -226,7 +226,12 @@ def block(
         carry = step(carry)
         return carry, None
 
-    state, _ = lax.scan(_scan_step, state, xs=None, length=params.n_prop_steps)
+    state, _ = lax.scan(
+        jax.checkpoint(_scan_step, prevent_cse=False),
+        state,
+        xs=None,
+        length=params.n_prop_steps,
+    )
 
     walkers_new = wk.orthonormalize(state.walkers, sys.walker_kind)
     overlaps_new = wk.vmap_chunked(meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None))(
@@ -379,8 +384,10 @@ def block_ad_1rdm(
             return state_out, (e_blocks, w_blocks)
 
         state_out, (e_groups, w_groups) = lax.scan(
-            sr_group, state_op, xs=None, length=n_sr_groups
+            jax.checkpoint(sr_group, prevent_cse=False),
+            state_op, xs=None, length=n_sr_groups,
         )
+
         e_blocks = jnp.ravel(e_groups)
         w_blocks = jnp.ravel(w_groups)
         weight = jnp.sum(w_blocks)
