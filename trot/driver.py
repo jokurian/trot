@@ -530,6 +530,10 @@ def run_qmc_ad_1rdm(
     block_e_parts = []
     block_w_parts = []
     block_rdm1_parts = []
+    out = Path(output).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    samples_out = out.with_name(f"{out.stem}_samples.npz")
+    samples_tmp = samples_out.with_suffix(".tmp")
     for n in range(1, n_ad_runs + 1):
         state, scalars_run, obs_run = run_ad_blocks(
             state,
@@ -547,6 +551,14 @@ def run_qmc_ad_1rdm(
         block_rdm1_parts.append(block_rdm1_run)
         block_e_so_far = np.concatenate(block_e_parts, axis=0)
         block_w_so_far = np.concatenate(block_w_parts, axis=0)
+        with samples_tmp.open("wb") as f:
+            np.savez(
+                f,
+                block_rdm1=np.concatenate(block_rdm1_parts, axis=0),
+                block_weights=block_w_so_far,
+                block_energies=block_e_so_far,
+            )
+        samples_tmp.replace(samples_out)
         stats_run = blocking_analysis_ratio(block_e_so_far, block_w_so_far, print_q=False)
         mu = stats_run["mu"]
         se = stats_run["se_star"]
@@ -594,8 +606,6 @@ def run_qmc_ad_1rdm(
         if num.shape[0] >= 2:
             _, rdm1_err = jackknife_ratios(num, denom)
 
-    out = Path(output).expanduser()
-    out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out, rdm1=rdm1, rdm1_err=rdm1_err)
     print(f"AFQMC energy = {mean_energy:.12f} +/- {stderr_energy:.3e}")
     if rdm1.ndim == 3 and rdm1.shape[0] == 2:
