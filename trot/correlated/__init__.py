@@ -1,4 +1,4 @@
-"""Differentiable parent–child correlated sampling for one-body changes."""
+"""Differentiable parent-child correlated sampling for one-body changes."""
 
 from __future__ import annotations
 
@@ -24,23 +24,49 @@ class CorrelatedResult(NamedTuple):
     block_energies: jax.Array
     block_weights: jax.Array
     alive: jax.Array
+    Q: jax.Array | None = None
+
 
 
 def parent_population_control(state: StatePair, zeta: jax.Array) -> StatePair:
-    """Resample both populations from parent weights, correcting child weights."""
+    # return parent_population_control_static(state, zeta)
+  return parent_population_control_dynamic(state, zeta)
+
+def parent_population_control_static(state: StatePair, zeta: jax.Array) -> StatePair:
     parent, child = state
     n = parent.weights.shape[0]
     idx = wk._sr_indices(parent.weights, zeta, n)
-    # At zeta=0, the left-sided search can select a leading zero-weight walker.
-    idx = jnp.where(parent.weights[idx] > 0, idx, jnp.argmax(parent.weights > 0))
-    selected_weights = parent.weights[idx]
-    avg = jnp.sum(parent.weights) / n
-    child_weights = avg * child.weights[idx] / jnp.where(selected_weights > 0, selected_weights, 1)
-    child_weights = jnp.where(selected_weights > 0, child_weights, 0)
+    avg_weights = jnp.mean(parent.weights[idx])
+    child_weights = child.weights[idx] * avg_weights/ parent.weights[idx]
     return (
         parent._replace(
             walkers=wk.take_walkers(parent.walkers, idx),
-            weights=jnp.full_like(parent.weights, avg),
+            weights=jnp.full_like(parent.weights, avg_weights),
+            overlaps=parent.overlaps[idx],
+        ),
+        child._replace(
+            walkers=wk.take_walkers(child.walkers, idx),
+            weights=child_weights,
+            overlaps=child.overlaps[idx],
+        ),
+    )
+
+
+
+def parent_population_control_dynamic(state: StatePair, zeta: jax.Array) -> StatePair:
+    parent, child = state
+    n = parent.weights.shape[0]
+    avg_weights_across_states = jnp.mean(jnp.stack([parent.weights, child.weights]), axis=0)
+    idx = wk._sr_indices(avg_weights_across_states, zeta, n)
+    
+    avg_2 = jnp.mean(parent.weights[idx])
+
+    parent_weights = parent.weights[idx]* avg_2 / avg_weights_across_states[idx]
+    child_weights = child.weights[idx] * avg_2 / avg_weights_across_states[idx] 
+    return (
+        parent._replace(
+            walkers=wk.take_walkers(parent.walkers, idx),
+            weights=parent_weights,
             overlaps=parent.overlaps[idx],
         ),
         child._replace(
@@ -87,8 +113,13 @@ def correlated_block(
     alive = jnp.all(jnp.isfinite(weights) & (weights > 0)) & jnp.all(
         jnp.isfinite(totals) & (totals > 0)
     )
+    parent_weights, child_weights = (s.weights for s, _ in outputs)
+    pair_weights = parent_weights + child_weights
+    Q = jnp.mean(
+        jnp.abs(parent_weights - child_weights)/(pair_weights)
+    )
     return states, BlockObs(
-        scalars={"energy": energies, "weight": weights, "alive": alive}, observables={}
+        scalars={"energy": energies, "weight": weights, "alive": alive, "Q": Q}, observables={}
     )
 
 
@@ -150,4 +181,14 @@ def run_correlated(
     means = jnp.sum(energies * weights, axis=0) / jnp.where(totals > 0, totals, 1)
     alive = jnp.all(samples["alive"])
     means = jnp.where(alive, means, jnp.nan)
-    return state, CorrelatedResult(means, means[1] - means[0], energies, weights, alive)
+    return state, CorrelatedResult(means, means[1] - means[0], energies, weights, alive, samples["Q"])
+
+
+from .wrapper import (
+    CorrelatedAfqmcResult as CorrelatedAfqmcResult,
+    CorrelatedDipoleResult as CorrelatedDipoleResult,
+    CorrelatedHyperfineResult as CorrelatedHyperfineResult,
+    run_correlated_afqmc as run_correlated_afqmc,
+    run_correlated_dipole as run_correlated_dipole,
+    run_correlated_hyperfine as run_correlated_hyperfine,
+)
