@@ -48,6 +48,9 @@ class CorrelatedAfqmcResult(NamedTuple):
     block_weights: np.ndarray
     Q: np.ndarray
     final_state: StatePair
+    eql_block_energies: np.ndarray | None = None
+    eql_block_weights: np.ndarray | None = None
+    eql_Q: np.ndarray | None = None
 
 
 class CorrelatedDipoleResult(NamedTuple):
@@ -261,6 +264,7 @@ def run_correlated_afqmc(
 
     print("\nE1 = parent, E2 = child; dE = paired block difference (Eh).", flush=True)
     started = perf_counter()
+    equilibration = (np.empty((0, 2)), np.empty((0, 2)), np.empty(0))
     for phase, n_blocks in (("eql", params.n_eql_blocks), ("prod", params.n_blocks)):
         energy_parts, weight_parts, q_parts = [], [], []
         for start in range(0, n_blocks, print_every):
@@ -298,13 +302,15 @@ def run_correlated_afqmc(
                 f"Q={q_values[-1]:.6e}  t={perf_counter() - started:.1f}s",
                 flush=True,
             )
+        if phase == "eql" and energy_parts:
+            equilibration = (energies, weights, q_values)
     if orbitals is not None:
         states = tuple(s._replace(walkers=(tuple(u @ w for w in s.walkers)
                                           if isinstance(s.walkers, tuple) else u @ s.walkers))
                        for s, u in zip(states, orbitals))
     return CorrelatedAfqmcResult(
         means[:2], errors[:2], float(means[2]), float(errors[2]),
-        energies, weights, q_values, states,
+        energies, weights, q_values, states, *equilibration,
     )
 
 

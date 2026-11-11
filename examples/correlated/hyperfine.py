@@ -75,4 +75,8 @@ np.savez(
     coupling_ccsdt=coupling_ccsdt,
     block_energies=result.afqmc.block_energies,
     block_weights=result.afqmc.block_weights, Q=result.afqmc.Q,
+    eql_block_energies=result.afqmc.eql_block_energies,
+    eql_block_weights=result.afqmc.eql_block_weights, eql_Q=result.afqmc.eql_Q,
+    n_eql_blocks=params.n_eql_blocks,
+    coupling_factor=HYPERFINE_PREFACTORS[mol.atom_pure_symbol(ATOM)] / (mol.spin * 2 * FIELD),
 )
