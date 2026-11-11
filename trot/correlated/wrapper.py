@@ -424,6 +424,7 @@ def run_correlated_hyperfine(
     *,
     params: QmcParams,
     prefactor: float | None = None,
+    staged: Any = None,
     frozen: Any = None,
     chol_cut: float = 1e-5,
     scf_tol: float = 1e-12,
@@ -437,6 +438,7 @@ def run_correlated_hyperfine(
     ghf, gcisd, or gccsd, using field-relaxed UHF converted to GHF. An isotope
     prefactor is looked up by element unless supplied; it is divided by mol.spin.
     Frozen indices restrict trial excitations only. The input MF is preserved.
+    Optional staged inputs must use this MF's zero-field GHF basis, without core removal.
     """
     from pyscf import cc, ci, scf
 
@@ -452,7 +454,8 @@ def run_correlated_hyperfine(
         prefactor = HYPERFINE_PREFACTORS[symbol]
     factor = prefactor / (mol.spin * 2 * field)
     reference = mf.to_ghf()
-    staged = stage(reference, norb_frozen_core=0, chol_cut=chol_cut)
+    if staged is None:
+        staged = stage(reference, norb_frozen_core=0, chol_cut=chol_cut)
     ham0 = _real_chol(HamChol(jnp.asarray(staged.ham.h0), jnp.asarray(staged.ham.h1),
                              jnp.asarray(staged.ham.chol), basis=staged.ham.basis))
     coeff = np.asarray(reference.mo_coeff)
