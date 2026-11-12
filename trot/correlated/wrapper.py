@@ -197,6 +197,7 @@ def run_correlated_afqmc(
     observable_factor: float | None = None,
     observable_offset: float = 0.0,
     population_control_fn: Callable = parent_population_control,
+    progress_callback: Callable | None = None,
 ) -> CorrelatedAfqmcResult:
     """Sample a pair of Hamiltonians using completed MF, CCSD, or CISD objects.
 
@@ -302,6 +303,8 @@ def run_correlated_afqmc(
                 f"Q={q_values[-1]:.6e}  t={perf_counter() - started:.1f}s",
                 flush=True,
             )
+            if progress_callback is not None:
+                progress_callback(phase, energies, weights, q_values, means[2], errors[2])
         if phase == "eql" and energy_parts:
             equilibration = (energies, weights, q_values)
     if orbitals is not None:
@@ -437,6 +440,7 @@ def run_correlated_hyperfine(
     trial_tol: float = 1e-10,
     print_every: int = 20,
     population_control_fn: Callable = parent_population_control,
+    progress_callback: Callable | None = None,
 ) -> CorrelatedHyperfineResult:
     """Isotropic Fermi-contact coupling (MHz) for a zero-based atom index.
 
@@ -511,6 +515,7 @@ def run_correlated_hyperfine(
         tuple(hams), nelec=staged.ham.nelec, trial_objects=tuple(trials), params=params,
         print_every=print_every, observable_factor=factor,
         population_control_fn=population_control_fn,
+        progress_callback=progress_callback,
     )
     coupling = factor * result.delta_energy
     error = abs(factor) * result.delta_energy_error
