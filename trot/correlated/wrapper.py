@@ -22,7 +22,8 @@ from ..meas.ghf import make_ghf_meas_ops_chol
 from ..meas.gcisd import make_gcisd_meas_ops
 from ..prop.afqmc import make_prop_ops
 from ..prop.types import QmcParams
-from ..stat_utils import blocking_analysis_ratio
+from ..stat_utils import blocking_analysis_ratio, reject_outliers
+from ..walkers import init_walkers
 from ..trial.rhf import make_rhf_trial_data, make_rhf_trial_ops
 from ..trial.uhf import make_uhf_trial_data, make_uhf_trial_ops
 from ..trial.cisd import make_cisd_trial_data, make_cisd_trial_ops
@@ -51,6 +52,19 @@ class CorrelatedAfqmcResult(NamedTuple):
     eql_block_energies: np.ndarray | None = None
     eql_block_weights: np.ndarray | None = None
     eql_Q: np.ndarray | None = None
+    keep_mask: np.ndarray | None = None
+
+    @property
+    def clean_block_energies(self):
+        return self.block_energies if self.keep_mask is None else self.block_energies[self.keep_mask]
+
+    @property
+    def clean_block_weights(self):
+        return self.block_weights if self.keep_mask is None else self.block_weights[self.keep_mask]
+
+    @property
+    def clean_Q(self):
+        return self.Q if self.keep_mask is None else self.Q[self.keep_mask]
 
 
 class CorrelatedDipoleResult(NamedTuple):
@@ -198,6 +212,8 @@ def run_correlated_afqmc(
     observable_offset: float = 0.0,
     population_control_fn: Callable = parent_population_control,
     progress_callback: Callable | None = None,
+    outlier_m: float | None = 10.0,
+    rdm1: Any = None,
 ) -> CorrelatedAfqmcResult:
     """Sample a pair of Hamiltonians using completed MF, CCSD, or CISD objects.
 
@@ -207,8 +223,14 @@ def run_correlated_afqmc(
     input basis. Frozen indices restrict trial excitations only.
     GHF/GCISD/GCCSD require generalized Hamiltonians with real Cholesky factors
     before and after reference rotation (imaginary tolerance 1e-12).
+    Final production dE statistics reject outliers by default; None disables
+    filtering. Raw samples are retained alongside keep_mask and clean arrays.
+    rdm1 is in the input Hamiltonians' common MO basis and initializes the
+    same natural-orbital determinant walkers for both states.
     """
 
+    if outlier_m is not None and (not np.isfinite(outlier_m) or outlier_m <= 0):
+        raise ValueError("outlier_m must be positive and finite, or None.")
     generalized_ham = ham_data[0].basis == "generalized"
     nmo = ham_data[0].h1.shape[0]
     if generalized_ham and nmo % 2:
@@ -253,10 +275,15 @@ def run_correlated_afqmc(
         if generalized:
             ham_data = tuple(_real_chol(h) for h in ham_data)
     prop_ops = make_prop_ops(ham_data[0].basis, sys.walker_kind)
+    initial_walkers = (None, None)
+    if rdm1 is not None:
+        walkers = init_walkers(sys, jnp.asarray(rdm1), params.n_walkers)
+        initial_walkers = (tuple(jax.tree_util.tree_map(lambda w: u.conj().T @ w, walkers)
+                                 for u in orbitals) if orbitals is not None else (walkers, walkers))
     states = tuple(prop_ops.init_prop_state(
         sys=sys, params=params, ham_data=h, trial_data=t,
-        trial_ops=trial_ops, meas_ops=meas_ops,
-    ) for h, t in zip(ham_data, trial_data))
+        trial_ops=trial_ops, meas_ops=meas_ops, initial_walkers=w,
+    ) for h, t, w in zip(ham_data, trial_data, initial_walkers))
     sample = jax.jit(partial(
         run_correlated, sys=sys,
         trial_ops=(trial_ops, trial_ops), meas_ops=(meas_ops, meas_ops),
@@ -287,6 +314,23 @@ def run_correlated_afqmc(
             ) for i in range(2)]
             delta = energies[:, 1] - energies[:, 0]
             stats.append(blocking_analysis_ratio(delta, np.ones(len(delta)), print_q=False))
+            if phase == "prod" and stop == n_blocks:
+                keep_mask = np.ones(len(delta), dtype=bool)
+                if outlier_m is not None:
+                    _, keep_mask = reject_outliers(
+                        delta[:, None], obs=0, m=outlier_m,
+                        min_threshold=np.finfo(float).eps,
+                    )
+                rejected = int((~keep_mask).sum())
+                print(f"Rejected {rejected} of {len(delta)} production blocks "
+                      f"(outlier_m={outlier_m}).", flush=True)
+                raw_error = stats[2]["se_star"]
+                print(f"Unfiltered dE={stats[2]['mu']:+.6e} +/- "
+                      f"{raw_error if raw_error is not None else np.nan:.2e} Eh", flush=True)
+                if not keep_mask.any():
+                    raise ValueError("Outlier rejection removed all production blocks.")
+                if rejected:
+                    stats[2] = blocking_analysis_ratio(delta, keep_mask.astype(float), print_q=False)
             means = np.array([s["mu"] for s in stats])
             errors = np.array([s["se_star"] if s["se_star"] is not None else np.nan for s in stats])
             observable_text = ""
@@ -313,7 +357,7 @@ def run_correlated_afqmc(
                        for s, u in zip(states, orbitals))
     return CorrelatedAfqmcResult(
         means[:2], errors[:2], float(means[2]), float(errors[2]),
-        energies, weights, q_values, states, *equilibration,
+        energies, weights, q_values, states, *equilibration, keep_mask,
     )
 
 
@@ -331,6 +375,8 @@ def run_correlated_dipole(
     origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
     print_every: int = 20,
     population_control_fn: Callable = parent_population_control,
+    outlier_m: float | None = 10.0,
+    rdm1: Any = None,
 ) -> CorrelatedDipoleResult:
     """Calculate one dipole component (a.u.) from paired fields -field/+field.
 
@@ -339,6 +385,9 @@ def run_correlated_dipole(
     family. Generalized trials use field-relaxed UHF converted to GHF.
     Frozen indices restrict trial excitations only. The origin is in
     Bohr. The supplied MF and its checkpoint are not modified.
+    outlier_m controls final paired-difference filtering; None disables it.
+    rdm1 initializes both states in the zero-field reference MO basis
+    (alpha MO basis for UHF, spin-orbital MO basis for GHF).
     """
     from pyscf import cc, ci, scf
 
@@ -418,6 +467,7 @@ def run_correlated_dipole(
         tuple(hams), nelec=staged.ham.nelec, trial_objects=tuple(trials), params=params,
         print_every=print_every, observable_factor=-1.0 / (2 * field),
         observable_offset=nuclear, population_control_fn=population_control_fn,
+        outlier_m=outlier_m, rdm1=rdm1,
     )
     dipole = nuclear - result.delta_energy / (2 * field)
     error = result.delta_energy_error / (2 * field)
@@ -441,6 +491,8 @@ def run_correlated_hyperfine(
     print_every: int = 20,
     population_control_fn: Callable = parent_population_control,
     progress_callback: Callable | None = None,
+    outlier_m: float | None = 10.0,
+    rdm1: Any = None,
 ) -> CorrelatedHyperfineResult:
     """Isotropic Fermi-contact coupling (MHz) for a zero-based atom index.
 
@@ -449,6 +501,8 @@ def run_correlated_hyperfine(
     prefactor is looked up by element unless supplied; it is divided by mol.spin.
     Frozen indices restrict trial excitations only. The input MF is preserved.
     Optional staged inputs must use this MF's zero-field GHF basis, without core removal.
+    outlier_m controls final paired-difference filtering; None disables it.
+    rdm1 initializes both states in the zero-field reference GHF MO basis.
     """
     from pyscf import cc, ci, scf
 
@@ -516,6 +570,7 @@ def run_correlated_hyperfine(
         print_every=print_every, observable_factor=factor,
         population_control_fn=population_control_fn,
         progress_callback=progress_callback,
+        outlier_m=outlier_m, rdm1=rdm1,
     )
     coupling = factor * result.delta_energy
     error = abs(factor) * result.delta_energy_error
