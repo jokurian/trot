@@ -218,7 +218,7 @@ def run_correlated_polarizability(
     ) for h, t, w in zip(hams, trial_data, initial_walkers))
     n_systems = len(hams)
     sample = jax.jit(partial(
-        run_correlated, sys=sys, ham_data=tuple(hams), trial_data=trial_data,
+        run_correlated, sys=sys,
         trial_ops=(trial_ops,) * n_systems, meas_ops=(meas_ops,) * n_systems,
         prop_ops=(prop_ops,) * n_systems, population_control_fn=population_control_fn,
     ), static_argnames=("params",))
@@ -234,7 +234,10 @@ def run_correlated_polarizability(
         energy_parts, weight_parts, q_parts = [], [], []
         for start in range(0, n_blocks, print_every):
             stop = min(start + print_every, n_blocks)
-            states, result = sample(states, params=replace(params, n_blocks=stop - start))
+            states, result = sample(
+                states, ham_data=tuple(hams), trial_data=trial_data,
+                params=replace(params, n_blocks=stop - start),
+            )
             if not bool(result.alive):
                 raise RuntimeError(f"A correlated population became extinct during {phase}.")
             energy_parts.append(np.asarray(result.block_energies))
